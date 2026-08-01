@@ -202,6 +202,27 @@ MODEL_PRESETS: Dict[str, ModelPreset] = {
     # ),
     
     # =========================================================================
+    # Krea2
+    # =========================================================================
+    "Krea2": ModelPreset(
+        name="Krea2",
+        description="Krea2 SingleStreamDiT (turbo, cfg=1)",
+        description_cn="Krea2 单流 DiT (turbo, cfg=1)",
+        forward_pattern="Pattern_3",
+        fn_blocks=8,
+        bn_blocks=0,
+        # Measured Krea2 residuals were ~0.29-0.39; 0.12 never caches.
+        threshold=0.35,
+        max_warmup_steps=3,
+        enable_separate_cfg=False,
+        cfg_compute_first=False,
+        skip_interval=0,
+        noise_scale=0.0,
+        default_strategy="adaptive",
+        taylor_order=0,
+    ),
+
+    # =========================================================================
     # Custom / Fallback
     # =========================================================================
     "Custom": ModelPreset(
@@ -559,16 +580,17 @@ def format_summary_dashboard(
     
     Returns a beautifully formatted string for terminal/log output.
     """
-    if not stats:
+    if not stats or stats.get("total_steps", 0) <= 0:
         width = 66
         lines = []
         lines.append("╔" + "═" * (width - 2) + "╗")
-        lines.append("║" + "CacheDiT Summary: No statistics available".center(width - 2) + "║")
-        lines.append("╠" + "═" + (width - 2) + "╣")
-        lines.append("║" + " Cache may not be active. Check:".ljust(width - 2) + "║")
-        lines.append("║" + "   1. Threshold may be too strict".ljust(width - 2) + "║")
-        lines.append("║" + "   2. Model may not support caching".ljust(width - 2) + "║")
-        lines.append("║" + "   3. Check logs for errors".ljust(width - 2) + "║")
+        lines.append("║" + "CacheDiT Summary: No run statistics".center(width - 2) + "║")
+        lines.append("╠" + "═" * (width - 2) + "╣")
+        lines.append("║" + " Transformer executed steps were not captured.".ljust(width - 2) + "║")
+        lines.append("║" + " Check:".ljust(width - 2) + "║")
+        lines.append("║" + "   1. Cache is enabled for this model".ljust(width - 2) + "║")
+        lines.append("║" + "   2. Sampling completed its last step".ljust(width - 2) + "║")
+        lines.append("║" + "   3. Check logs for cache-dit errors".ljust(width - 2) + "║")
         lines.append("╚" + "═" * (width - 2) + "╝")
         return "\n".join(lines)
     
@@ -696,28 +718,59 @@ def get_summary_stats(transformer: torch.nn.Module) -> Dict[str, Any]:
             logger.warning("[CacheDiT] cache_dit.summary() returned None - cache may not be active")
             return {}
         
-        # Normalize stats to consistent format
+        # cache_dit.summary() returns List[CacheStats]; the transformer-level
+        # entry is the last item and is what upstream uses for overall totals.
+        if not isinstance(stats, (list, tuple)):
+            stats = [stats]
+        stats = [s for s in stats if s is not None]
+        if not stats:
+            logger.warning("[CacheDiT] cache_dit.summary() returned no stats")
+            return {}
+
+        overall = stats[-1]
+
+        def _get(stat, name, default):
+            if isinstance(stat, dict):
+                return stat.get(name, default)
+            return getattr(stat, name, default)
+
+        total_steps = int(_get(overall, "accumulated_transformer_executed_steps", 0) or 0)
+        cached_steps = int(_get(overall, "accumulated_cached_steps", 0) or 0)
+        cached_steps += int(_get(overall, "cfg_accumulated_cached_steps", 0) or 0)
+        computed_steps = max(total_steps - cached_steps, 0)
+
+        residual_diffs = []
+        for stat in stats:
+            for diff in (_get(stat, "residual_diffs", {}) or {}).values():
+                if isinstance(diff, (list, tuple)):
+                    residual_diffs.extend(float(v) for v in diff)
+                else:
+                    residual_diffs.append(float(diff))
+            for diff in (_get(stat, "cfg_residual_diffs", {}) or {}).values():
+                if isinstance(diff, (list, tuple)):
+                    residual_diffs.extend(float(v) for v in diff)
+                else:
+                    residual_diffs.append(float(diff))
+
+        avg_diff = float(sum(residual_diffs) / len(residual_diffs)) if residual_diffs else 0.0
+        max_diff = float(max(residual_diffs)) if residual_diffs else 0.0
+        speedup = total_steps / computed_steps if total_steps > 0 and computed_steps > 0 else 1.0
+
         result = {
-            "total_steps": getattr(stats, "total_steps", 0),
-            "cached_steps": getattr(stats, "cached_steps", 0),
-            "computed_steps": getattr(stats, "computed_steps", 0),
-            "avg_residual_diff": getattr(stats, "avg_diff", 0.0),
-            "max_residual_diff": getattr(stats, "max_diff", 0.0),
-            "speedup": getattr(stats, "speedup", 1.0),
+            "total_steps": total_steps,
+            "cached_steps": cached_steps,
+            "computed_steps": computed_steps,
+            "avg_residual_diff": avg_diff,
+            "max_residual_diff": max_diff,
+            "speedup": speedup,
             "raw": stats,
         }
-        
-        # Calculate speedup if not provided
-        if result["speedup"] == 1.0 and result["total_steps"] > 0:
-            computed = result["computed_steps"] or (result["total_steps"] - result["cached_steps"])
-            if computed > 0:
-                result["speedup"] = result["total_steps"] / computed
         
         # Debug log if no caching occurred
         if result["total_steps"] > 0 and result["cached_steps"] == 0:
             logger.warning(
                 f"[CacheDiT] No steps were cached! "
-                f"Check threshold ({result.get('threshold', 'N/A')}) - it may be too strict."
+                f"Check threshold - it may be too strict."
             )
         
         return result
@@ -742,9 +795,9 @@ def print_summary_to_log(
     stats = get_summary_stats(transformer)
     dashboard = format_summary_dashboard(stats, model_type, num_steps, config_info)
     
-    # Print to log
+    # ComfyUI logging already mirrors logger output to console; printing again
+    # produces a second dashboard in the same run.
     logger.info("\n" + dashboard)
-    print("\n" + dashboard)  # Also print to console
     
     return dashboard
 
