@@ -1078,6 +1078,7 @@ def _enable_cache_dit(
             "NextDiT",        # Z-Image
             "QwenImage",      # Qwen-Image
             "Flux",           # Flux.1 and Flux.2
+            "SingleStreamDiT",  # Krea2: BlockAdapter breaks nodes that loop model.blocks
         ]
 
         if use_lightweight:
