@@ -669,7 +669,11 @@ def _get_lightweight_cache_stats():
         return None
 
     cache_hit_rate = (cache_hits / total_calls) * 100
-    avg_time = sum(state["compute_times"]) / max(len(state["compute_times"]), 1)
+    # First call can include lazy weight loading; keep it out of the average.
+    times = state["compute_times"]
+    first_time = times[0] if times else 0.0
+    rest = times[1:] or times
+    avg_time = sum(rest) / max(len(rest), 1)
     estimated_speedup = total_calls / max(compute_count, 1)
 
     return {
@@ -679,6 +683,7 @@ def _get_lightweight_cache_stats():
         "cache_hit_rate": cache_hit_rate,
         "estimated_speedup": estimated_speedup,
         "avg_compute_time": avg_time,
+        "first_compute_time": first_time,
     }
 
 
@@ -917,7 +922,8 @@ def _cache_dit_outer_sample_wrapper(executor, *args, **kwargs):
                         f"  Cached: {lightweight_stats['cached_steps']}\n"
                         f"  Cache Hit Rate: {lightweight_stats['cache_hit_rate']:.1f}%\n"
                         f"  Estimated Speedup: {lightweight_stats['estimated_speedup']:.2f}x\n"
-                        f"  Avg Compute Time: {lightweight_stats['avg_compute_time']:.3f}s"
+                        f"  First Compute Time: {lightweight_stats['first_compute_time']:.3f}s\n"
+                        f"  Avg Compute Time (rest): {lightweight_stats['avg_compute_time']:.3f}s"
                     )
                 else:
                     # Use standard cache-dit statistics
